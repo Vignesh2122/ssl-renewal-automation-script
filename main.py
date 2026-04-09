@@ -3,6 +3,8 @@ import time
 import json
 import logging
 from datetime import datetime, timedelta
+import socket
+import ssl
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -58,30 +60,117 @@ def get_unique_security_groups(instance_ids):
 def manage_port_80(sg_id, action):
     logger.info(f"[manage_port_80] Action: {action} on SG: {sg_id}")
     try:
+        response = ec2.describe_security_groups(GroupIds=[sg_id])
+        rules = response['SecurityGroups'][0]['IpPermissions']
+        rule_exists = any(
+            r.get('IpProtocol') == 'tcp' and
+            r.get('FromPort') == 80 and
+            r.get('ToPort') == 80 and
+            any(ip.get('CidrIp') == '0.0.0.0/0' for ip in r.get('IpRanges', []))
+            for r in rules
+        )
         permission = [{"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
         if action == "authorize":
+            if rule_exists:
+                logger.info(f"[manage_port_80] Port 80 already open on {sg_id}, skipping")
+                return
             ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=permission)
             logger.info(f"[manage_port_80] Port 80 OPENED on {sg_id}")
-        else:
+        elif action == "revoke":
+            if not rule_exists:
+                logger.info(f"[manage_port_80] Port 80 already closed on {sg_id}, skipping")
+                return
             ec2.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=permission)
             logger.info(f"[manage_port_80] Port 80 CLOSED on {sg_id}")
     except Exception as e:
-        logger.warning(f"[manage_port_80] {action} skipped for {sg_id} (may already exist/not exist): {e}")
+        logger.error(f"[manage_port_80] {action} failed for {sg_id}: {e}")
 
 
-def schedule_next_run(rule_name, days_ahead=64):
-    logger.info(f"[schedule_next_run] Scheduling next run in {days_ahead} days")
+def get_domains_from_instance(instance_ids):
+    logger.info(f"[get_domains_from_instance] Fetching certbot domains from: {instance_ids}")
     try:
-        future_date = datetime.now() + timedelta(days=days_ahead)
+        response = ssm.send_command(
+            InstanceIds=instance_ids,
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": ["sudo certbot certificates 2>/dev/null | grep 'Domains:' | awk '{print $2}'"]},
+        )
+        command_id = response["Command"]["CommandId"]
+
+        for _ in range(10):
+            time.sleep(3)
+            output = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_ids[0])
+            if output['Status'] in ('Success', 'Failed'):
+                break
+
+        stdout = output.get('StandardOutputContent', '').strip()
+        domains = [d.strip() for d in stdout.splitlines() if d.strip()]
+        logger.info(f"[get_domains_from_instance] Found domains: {domains}")
+        return domains
+    except Exception as e:
+        logger.error(f"[get_domains_from_instance] Failed: {e}")
+        return []
+
+
+def check_ssl_expiry(domains):
+    logger.info(f"[check_ssl_expiry] Checking SSL expiry for domains: {domains}")
+    needs_renewal = False
+    for domain in domains:
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((domain, 443), timeout=10) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                    cert = ssock.getpeercert()
+                    expiry_date = datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                    days_remaining = (expiry_date - datetime.utcnow()).days
+                    logger.info(f"[check_ssl_expiry] {domain} → {days_remaining} days remaining")
+                    if days_remaining <= 30:
+                        logger.info(f"[check_ssl_expiry] {domain} needs renewal")
+                        needs_renewal = True
+        except Exception as e:
+            logger.warning(f"[check_ssl_expiry] Could not check {domain}, will renew to be safe: {e}")
+            needs_renewal = True
+    return needs_renewal
+
+
+def schedule_next_run(rule_name, domains):
+    logger.info(f"[schedule_next_run] Calculating next run based on cert expiry")
+    try:
+        earliest_expiry = None
+        for domain in domains:
+            try:
+                context = ssl.create_default_context()
+                with socket.create_connection((domain, 443), timeout=10) as sock:
+                    with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                        cert = ssock.getpeercert()
+                        expiry_date = datetime.strptime(cert['notAfter'], "%b %d %H:%M:%S %Y %Z")
+                        logger.info(f"[schedule_next_run] {domain} expires: {expiry_date.strftime('%Y-%m-%d')}")
+                        if earliest_expiry is None or expiry_date < earliest_expiry:
+                            earliest_expiry = expiry_date
+            except Exception as e:
+                logger.warning(f"[schedule_next_run] Could not check {domain}: {e}")
+
+        if earliest_expiry is None:
+            logger.warning("[schedule_next_run] Could not determine expiry, falling back to 50 days")
+            next_run = datetime.utcnow() + timedelta(days=50)
+        else:
+            next_run = earliest_expiry - timedelta(days=5)
+            logger.info(f"[schedule_next_run] Earliest expiry: {earliest_expiry.strftime('%Y-%m-%d')}")
+            logger.info(f"[schedule_next_run] Next run (5 days before expiry): {next_run.strftime('%Y-%m-%d')}")
+
+            if next_run < datetime.utcnow():
+                logger.warning("[schedule_next_run] Next run date is in the past, scheduling 1 day from now")
+                next_run = datetime.utcnow() + timedelta(days=1)
+
         cron_expression = "cron({} {} {} {} ? {})".format(
-            future_date.minute,
-            future_date.hour,
-            future_date.day,
-            future_date.month,
-            future_date.year
+            next_run.minute,
+            next_run.hour,
+            next_run.day,
+            next_run.month,
+            next_run.year
         )
         logger.info(f"[schedule_next_run] Cron expression: {cron_expression}")
-        logger.info(f"[schedule_next_run] Scheduled date: {future_date.strftime('%Y-%m-%d %H:%M UTC')}")
+        logger.info(f"[schedule_next_run] Scheduled date: {next_run.strftime('%Y-%m-%d %H:%M UTC')}")
+
         events.put_rule(
             Name=rule_name,
             ScheduleExpression=cron_expression,
@@ -108,7 +197,7 @@ def run_ssm_command_and_wait(instance_ids, cmd):
 
         overall_success = True
         for iid in instance_ids:
-            for attempt in range(12):  # max 60s (12 x 5s)
+            for attempt in range(36):  # max 180s (36 x 5s)
                 time.sleep(5)
                 output = ssm.get_command_invocation(CommandId=command_id, InstanceId=iid)
                 status = output['Status']
@@ -147,17 +236,29 @@ def lambda_handler(event, context):
         return {'statusCode': 200, 'body': json.dumps('No running instances.')}
 
     sg_ids = get_unique_security_groups(target_instances)
+
+    # dynamically fetch domains from instance
+    domains = get_domains_from_instance(target_instances)
+    if not domains:
+        logger.warning("[lambda_handler] No domains found, proceeding with renewal anyway")
+    else:
+        if not check_ssl_expiry(domains):
+            logger.info("[lambda_handler] All certs healthy (>30 days), skipping renewal")
+            # still update schedule based on actual expiry
+            schedule_next_run(EVENT_RULE_NAME, domains)
+            return {'statusCode': 200, 'body': json.dumps('All certs healthy, skipping.')}
+
     logger.info(f"[lambda_handler] Opening port 80 on SGs: {sg_ids}")
     for sg in sg_ids:
         manage_port_80(sg, "authorize")
 
     try:
-        cmd = "sudo certbot renew && (sudo systemctl reload nginx || sudo systemctl reload apache2 || true)"
+        cmd = "sudo rm -f /var/lib/letsencrypt/.certbot.lock /tmp/.certbot.lock && sudo certbot renew && (sudo systemctl reload nginx || sudo systemctl reload apache2 || true)"
         logger.info("[lambda_handler] Running certbot renewal via SSM...")
 
         if run_ssm_command_and_wait(target_instances, cmd):
             logger.info("[lambda_handler] Certbot renewal SUCCESS")
-            schedule_next_run(EVENT_RULE_NAME, days_ahead=64)
+            schedule_next_run(EVENT_RULE_NAME, domains)
             logger.info("[lambda_handler] Lambda completed successfully")
             return {'statusCode': 200, 'body': json.dumps('Success')}
         else:
